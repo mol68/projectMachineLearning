@@ -1,0 +1,160 @@
+# PREDICTING HOW WEIGHT LIFTS ARE DONE 
+
+
+```{r include=FALSE}
+library(kernlab)
+library(e1071)
+library(caret)
+library(randomForest)
+library(gbm)
+```
+
+
+The aim of this project is to develop a machine learning algorithm to predict the way a weight lift is done (its quality measured in five classes: A, B, C, D, E). For that, data collected from accelerometers on the belt, forearm, arm, and dumbbell and exercise quality of several subjects are used (pml-training.csv). This machine learning model will be used to predict the class for twenty new cases (pml-testing.csv). More information about the data: http://groupware.les.inf.puc-rio.br/har.
+
+```{r}
+download.file("http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",destfile="./pml-training.csv")
+download.file("http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",destfile="./pml-testing.csv")
+pmltraining<-read.csv("pml-training.csv",sep=",")
+pmltesting<-read.csv("pml-testing.csv",sep=",")
+```
+
+
+First, the original pml-training set is divided in two parts: training (70%) and testing (30%). This second subset will be used to calculate an estimated measure of the out-of-sample or generalization error (accuracy in the testing set).
+
+```{r}
+set.seed(123)
+inTrain<-createDataPartition(pmltraining$classe,p=0.7,list=FALSE)
+training<-pmltraining[inTrain,]
+testing<-pmltraining[-inTrain,]
+```
+
+Some cleaning and preprocessing is done on the training set. Specifically, the first six variables (not numerical) are deleted, as well as the variables with many missing values, those with variance near zero and those highly correlated with others. The same operations are made on the testing set.
+
+
+```{r}
+# First six variables removed
+training<-subset(training,select=-c(X,user_name,cvtd_timestamp,new_window,raw_timestamp_part_1,raw_timestamp_part_2))
+testing<-subset(testing,select=-c(X,user_name,cvtd_timestamp,new_window,raw_timestamp_part_1,raw_timestamp_part_2))
+
+# Variables with many missing values removed
+delet<-NULL
+for (i in 1:dim(training)[2]){
+  if ((sum(is.na(training[,i]))>6000) | (sum(training[,i]=="")>6000)) delet<-c(delet,i)
+}
+training<-training[,-delet]
+testing<-testing[,-delet]
+
+# Variables with near zero variance removed
+nzv <- nearZeroVar(training)
+if (length(nzv)>0){
+  training<-training[,-nzv]
+  testing<-testing[,-nzv]
+}
+
+# Variables highly correlated removed
+descrCor <- cor(training[,-length(training)])
+highlyCor <- findCorrelation(descrCor, cutoff = 0.9)
+training <- training[, -highlyCor]
+testing <- testing[, -highlyCor]
+```
+
+
+Different models (trees, random forest and generalized boosted regression) are fitted and compared using accuracy (percentage of correct classifications) in the testing set. 
+
+```{r}
+accuracy<-function(pred,obs){
+  confmat<-confusionMatrix(pred,obs)
+  accuracy<-confmat$overall[1]
+  return(accuracy)
+}
+```
+
+Trees without and with preprocessing using principal component analysis are tried, but they obtain low accuracy.
+
+```{r message=FALSE, warning=FALSE}
+# Tree without preprocessing
+set.seed(526)
+modFit1<-train(classe ~ .,data=training, method="rpart")
+pred1<-predict(modFit1,newdata=testing)
+accuracy(pred1,testing$classe)
+```
+
+
+```{r}
+# Tree with PCA preprocessing
+set.seed(963)
+modFit2<-train(classe ~ .,data=training,preProcess="pca",method="rpart")
+pred2<-predict(modFit2,newdata=testing)
+accuracy(pred2,testing$classe)
+```
+
+
+As random forests require more intensive computing, because of the large number of cases and variables, they are first trained with small samples to determine the most important variables by crossvalidation. Then, a random forest is fitted using all training data and only the important variables previously selected. It can be observed that 50 trees are enough to obtain very good performance (almost all cases in the testing set are well classified).
+
+
+```{r}
+# Selecting important variables in small samples using crossvalidation
+selecvarCV<-function(trainingset,n){
+  var<-NULL
+  for (i in 1:n){
+    few<-createDataPartition(trainingset$classe,p=0.1,list=FALSE)
+    trainingfew<-trainingset[few,]
+    crossvalfew<-rfcv(trainingfew[,1:(length(trainingfew)-1)], trainingfew[,length(trainingfew)],cv.fold=5)
+    var<-sort(union(var,crossvalfew$n.var))
+  }
+ return(var)
+}
+set.seed(1177)
+varrf<-selecvarCV(training,3)
+
+# Fitting random forest using before selected variables
+set.seed(5687)
+modFit3<-randomForest(training[,varrf],training[,length(training)], ntree=50,importance=TRUE,prox=FALSE)
+plot(modFit3)
+pred3<-predict(modFit3,newdata=testing)
+accuracy(pred3,testing$classe)
+varImpPlot(modFit3)
+```
+
+
+Generalized boosted regression with cross-validation to select the best model is also tried, but the results are not good.
+
+
+```{r}
+# Function to pass predicted probabilities to predicted classes
+predlevel<-function(predprob){
+  predprob<-as.data.frame(predprob)
+  r<-regexec("[A-E]",colnames(predprob))
+  colnames(predprob)<-unlist(regmatches(colnames(predprob),r))
+  predclass<-rep("A",dim(predprob)[1])
+  for (i in 1:dim(predprob)[1]){
+    predclass[i]<-names(which.max(predprob[i,]))
+  }
+  return(predclass)
+}
+
+# Fitting gbm using CV to select the best model
+set.seed(699)
+modFit4<-gbm(classe ~ .,data=training, distribution="multinomial",n.trees=500, cv.folds=10,verbose=FALSE)
+best.iter <- gbm.perf(modFit4,method="cv")
+predprob<-predict(modFit4,newdata=testing,best.iter,type = "response")
+pred4<-predlevel(predprob)
+accuracy(pred4,testing$classe)
+```
+
+
+Given its accuracy in the testing set, random forest model (modFit3) is the clear choice and, therefore, is used for predictions involved in pmltesting test.
+
+```{r}
+pmltesting<-subset(pmltesting,select=-c(X,user_name,cvtd_timestamp,new_window,raw_timestamp_part_1,raw_timestamp_part_2))
+pmltesting<-pmltesting[,-delet]
+pmltesting <- pmltesting[, -highlyCor]
+if (length(nzv)>0){
+  pmltesting<-pmltesting[,-nzv]
+}
+predpmltestingmod3<-predict(modFit3,pmltesting)
+predpmltestingmod3 
+```
+ 
+
